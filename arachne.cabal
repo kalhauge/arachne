@@ -20,6 +20,7 @@ library
   -- main-is:             Main.hs
   exposed-modules:
     Arachne
+    Arachne.GraphT
   -- other-extensions:
   build-depends:
       base >=4.12 && <4.14
@@ -36,5 +37,29 @@ library
     , path
     , template-haskell
     , text
+    , unliftio
+    , unliftio-core
   hs-source-dirs: src
   default-language:    Haskell2010
+
+test-suite test-arachne
+  type:  exitcode-stdio-1.0
+  main-is: Main.hs
+  hs-source-dirs: test
+  extra-source-files:
+    USAGE.txt
+  other-modules:
+    Arachne.GraphTSpec
+    Spec
+  build-depends:
+      base >=4.12 && <4.14
+    , arachne
+    , hspec
+    , hspec-discover
+    , HUnit
+    , hspec-expectations-pretty-diff
+    , hspec-hedgehog
+    , hedgehog
+    , text
+    , adjunctions >=4.4
+    , aeson

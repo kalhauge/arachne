@@ -1,6 +1,8 @@
 {-# LANGUAGE DeriveFunctor #-}
+{-# LANGUAGE EmptyCase #-}
 {-# LANGUAGE RecordWildCards #-}
 {-# LANGUAGE OverloadedStrings #-}
+{-# LANGUAGE FlexibleInstances #-}
 {-# LANGUAGE DeriveGeneric #-}
 {-# LANGUAGE QuasiQuotes #-}
 {-# LANGUAGE FlexibleContexts #-}
@@ -100,6 +102,9 @@ import qualified Crypto.Hash.SHA256 as SHA256 (hashlazy)
 -- path
 import Path
 
+-- arachne
+import Arachne.GraphT
+
 -- $pagerefs
 -- The goal
 
@@ -145,8 +150,7 @@ staticRoutes = \case
 -- $page
 
 data PageGenF s r f
-  = GetResourcePG (Path Rel File) (Maybe BL.ByteString -> f)
-  | forall a e. Exception e => ThrowPG e (a -> f)
+  = forall a e. Exception e => ThrowPG e (a -> f)
   | forall a. Hashable a => GetPageRef (s -> a) (a -> f)
 
 deriving instance Functor (PageGenF s r)
@@ -191,8 +195,7 @@ instance Exception SiteGenerationFailed
 -- | Site Gen.
 data SiteGenF s f
   = forall r. MakePage (Route r) (Page s r) ((r -> PageRef) -> f)
-  | forall a. InternalLiftIO (IO a) (a -> f)
-  | GetResourceSG (Path Rel File) (Maybe BL.ByteString -> f)
+  | forall r. LiftGraph (GraphT IO r) (r -> f)
 
 deriving instance Functor (SiteGenF s)
 
@@ -206,32 +209,18 @@ instance MonadFree (SiteGenF s) (SiteGen s) where
   wrap = SiteGen . wrap . fmap unSiteGen
   {-# INLINE wrap #-}
 
-instance MonadIO (SiteGen s) where
-  liftIO = internalLiftIO
+instance MonadResource (SiteGen s) where
+  getResource = liftGraph . getResource
+  {-# INLINE getResource #-}
 
 instance MonadThrow (SiteGen s) where
-  throwM = liftIO . throwM
-
-
--- | Get a resource.
-getResourceSG :: Path Rel File -> SiteGen s (Maybe BL.ByteString)
+  throwM = liftGraph . throwM
 
 -- | Create a new page.
 makePage ::
   Route r
   -> Page s r
   -> SiteGen s (r -> PageRef)
-
-class MonadResource m where
-  -- | Get a resource.
-  getResource :: Path Rel File -> m (Maybe BL.ByteString)
-
-instance MonadResource (SiteGen s) where
-  getResource = getResourceSG
-
-instance MonadResource (PageGen s r) where
-  getResource = getResourcePG
-
 
 -- | Create a new page from a static route.
 makeStaticPage ::
@@ -287,6 +276,7 @@ data SiteConfig = SiteConfig
   { siteBaseUrl   :: !(Maybe (Path Rel Dir))
   , siteOutput    :: !(Path Rel Dir)
   , siteResources :: !(Path Rel Dir)
+  , siteCache     :: !(Path Rel Dir)
   , sitePort      :: !Int
   }
 
@@ -295,6 +285,7 @@ defaultConfig = SiteConfig
   { siteBaseUrl = Nothing
   , siteOutput = [reldir|www|]
   , siteResources = [reldir|resources|]
+  , siteCache = [reldir|.cache|]
   , sitePort = 8080
   }
 
@@ -312,35 +303,48 @@ generatePage :: SiteConfig -> s -> r -> PageGen s r a -> IO a
 generatePage cfg s r (PageGen f) = flip F.iterM f \case
   ThrowPG e f ->
     throwM e
-  GetResourcePG path mx ->
-    mx =<< getResourceIO cfg path
   GetPageRef fn ma ->
     ma (fn s)
 
 -- | Creates the pages of the site.
-createPages :: forall s. SiteConfig -> SiteGen s s -> IO (s, [AnchoredPage s])
+createPages :: forall s. SiteConfig -> SiteGen s s -> GraphT IO (s, [AnchoredPage s])
 createPages cfg (SiteGen f) = runWriterT $ flip F.iterM f \case
-  InternalLiftIO ioa mx ->
-    mx =<< liftIO ioa
-  MakePage route gen mx -> do
-    tell [AnchoredPage route gen]
-    case route of
-      StaticRoute url -> do
-        mx \() -> PageRef url (siteBaseUrl cfg)
-  GetResourceSG path mx -> do
-    mx =<< liftIO (getResourceIO cfg path)
+  -- LiftGraph grph mx -> do
+  --   r <- lift grph
+  --   mx r
+
+  -- MakePage route gen mx -> do
+  --   tell [AnchoredPage route gen]
+  --   case route of
+  --     StaticRoute url -> do
+  --       lift $ pullG (putStrLn $ "Write" ++ show url)
+  --       mx \() -> PageRef url (siteBaseUrl cfg)
+  -- GetResourceSG path mx -> do
+  --   mx =<< liftIO (getResourceIO cfg path)
 
 -- | Serves the site
 serveSite :: SiteConfig -> SiteGen s s -> IO ()
 serveSite cfg st = do
-  (s, pages) <- createPages cfg st
-  createDirectoryIfMissing True (fromRelDir $ siteOutput cfg)
-  forM_ pages \(AnchoredPage route page) -> do
-    routes <- staticRoutes route
-    case page of
-      StaticPage fn -> forM_ routes \(url, r) -> do
-        page <- generatePage cfg s r fn
-        BL.writeFile (fromRelFile $ siteOutput cfg </> url) page
+  putStrLn $ "Creating Graph"
+  let gfg = GraphConfig (siteResources cfg) (siteCache cfg)
+  str <- oneShot' gfg $ do
+    let x = 10
+    a <- return "hello"
+    return (a ++ "bind")
+  print str
+  -- print gfg
+  -- (s, pages) <- createPages cfg st
+  -- (s, pages) <- oneShot' gfg $ createPages cfg st
+  -- print "Hello, yeah!"
+  -- createDirectoryIfMissing True (fromRelDir $ siteOutput cfg)
+  -- forM_ pages \(AnchoredPage route page) -> do
+  --   routes <- staticRoutes route
+  --   case page of
+  --     StaticPage fn -> forM_ routes \(url, r) -> do
+  --       page <- generatePage cfg s r fn
+  --       BL.writeFile (fromRelFile $ siteOutput cfg </> url) page
+
+  putStrLn $ "Starting Server at " ++ show (sitePort cfg)
 
   simpleHTTP nullConf { logAccess = Just logMAccess, port = sitePort cfg } $ do
     serveDirectory DisableBrowsing ["index.html"] (fromRelDir $ siteOutput cfg)
@@ -353,9 +357,9 @@ serveSite cfg st = do
 serveStatic ::
   Path Rel File
   -> SiteGen s PageRef
-serveStatic file = makeStaticPage file do
-  getResourceOrFail file
-
+serveStatic file = do
+  bytes <- getResourceOrFail file
+  makeStaticPage file (return bytes)
 
 -- | Server a static file with hash. This allows us to cache the file in
 -- the client browser. Especially good for images and scripts that do
@@ -373,18 +377,21 @@ serveStaticWithHash file = do
 
 
 data SiteRefs = SiteRefs
-  { srIndex :: PageRef
+  { -- srIndex :: PageRef
+  -- , srOther :: PageRef
   }
 
 main :: IO ()
 main = serveSite defaultConfig do
-  srIndex <- makeStaticHtmlPage [relfile|index.html|] do
-    doctype_
-    h1_ "Hello World!"
-    p_ "This is an example code piece"
-    withHref srIndex (a_ "index")
+  -- srOther <- serveStatic [relfile|hello.html|]
+  -- srIndex <- makeStaticHtmlPage [relfile|index.html|] do
+  --   doctype_
+  --   h1_ "Hello World!"
+  --   p_ "This is an example code piece"
+  --   withHref srIndex (a_ "index")
+  --   withHref srIndex (a_ "other")
 
-  return $ SiteRefs { .. }
+  return $ SiteRefs {}
 
 
 
